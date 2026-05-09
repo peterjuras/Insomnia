@@ -484,10 +484,23 @@ function buildCodexNotifyLine() {
   return `notify = ["node", "${hookPath}", "stay-awake", "codex-cli"]`;
 }
 
-// Strip lines from a Codex config.
-// mode='setup'   → drop ALL top-level notify lines (Codex only honours one) and our marker line
-// mode='remove'  → drop only our marker line and top-level notify lines pointing at agent-hook.js
-function stripCodexNotify(lines, mode) {
+function hasExternalCodexNotify(lines) {
+  let inSection = false;
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (trimmed.startsWith('[')) {
+      inSection = true;
+      continue;
+    }
+    if (!inSection && /^\s*notify\s*=/.test(line) && !line.includes('agent-hook.js')) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// Strip only Insomnia's Codex notify hook, leaving user-managed notify commands alone.
+function stripCodexNotify(lines) {
   const out = [];
   let inSection = false;
   for (const line of lines) {
@@ -499,8 +512,7 @@ function stripCodexNotify(lines, mode) {
       continue;
     }
     if (!inSection && /^\s*notify\s*=/.test(line)) {
-      if (mode === 'setup') continue;
-      if (mode === 'remove' && line.includes('agent-hook.js')) continue;
+      if (line.includes('agent-hook.js')) continue;
     }
     out.push(line);
   }
@@ -525,7 +537,14 @@ function setupCodexHooks() {
     if (fs.existsSync(configPath)) content = fs.readFileSync(configPath, 'utf8');
   } catch {}
 
-  const stripped = stripCodexNotify(content.split(/\r?\n/), 'setup');
+  const stripped = stripCodexNotify(content.split(/\r?\n/));
+
+  // Codex only honours one top-level notify command. If the user already has
+  // their own, preserve it and rely on transcript polling for app-server activity.
+  if (hasExternalCodexNotify(stripped)) {
+    fs.writeFileSync(configPath, stripped.length ? stripped.join('\n') + '\n' : '');
+    return;
+  }
 
   // Prepend our notify block; pad with a blank line before any further content.
   const block = [INSOMNIA_NOTIFY_MARKER, buildCodexNotifyLine()];
@@ -540,7 +559,7 @@ function removeCodexHooks() {
   if (!fs.existsSync(configPath)) return;
   try {
     const content = fs.readFileSync(configPath, 'utf8');
-    const lines = stripCodexNotify(content.split(/\r?\n/), 'remove');
+    const lines = stripCodexNotify(content.split(/\r?\n/));
     fs.writeFileSync(configPath, lines.length ? lines.join('\n') + '\n' : '');
   } catch {}
 }

@@ -41,6 +41,7 @@ Suggested note format:
 ### 2026-05-09
 - [Codex] Repo is public at `https://github.com/stanley-projects/Insomnia` with GitHub Pages at `https://stanley-projects.github.io/Insomnia/`. Public promotion so far includes the DEV post "I Built a Tiny Electron App to Stop Windows From Killing My Claude Code Sessions"; earlier memory also records posts on Reddit in r/ClaudeAI, r/SideProject, and r/electronjs. Note: the DEV post still describes Codex as process-watched, which matches the public v1.3 era but not the local v1.4.2 Codex activity work.
 - [Codex] Committing and pushing local v1.4.2 source changes to `master`: package version bump, UI/footer version bump, README/docs updates, Codex notify hook setup, Codex session-transcript activity watcher for VS Code/standalone app-server surfaces, startup migration/cleanup, and this shared memory file. Claude Code hook setup is intentionally unchanged.
+- [Codex] Post-push safety review found one detrimental edge case: Codex hook setup dropped any existing top-level `notify` command in `~/.codex/config.toml`. Fixed so Insomnia only removes/replaces its own `agent-hook.js` notify line. If the user already has a custom Codex notify command, Insomnia preserves it and relies on session-transcript polling for app-server activity.
 
 ## Current State (as of 2026-05-09)
 

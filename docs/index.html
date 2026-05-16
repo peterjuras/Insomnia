@@ -36,7 +36,7 @@
     "description": "Lightweight Windows app that prevents your PC from sleeping while AI coding tools are running.",
     "url": "https://stanley-projects.github.io/Insomnia/",
     "downloadUrl": "https://github.com/stanley-projects/Insomnia/releases/latest",
-    "softwareVersion": "1.4.2",
+    "softwareVersion": "1.4.3",
     "license": "https://opensource.org/licenses/MIT",
     "author": { "@type": "Organization", "name": "Stanley Projects", "url": "https://github.com/stanley-projects" }
   }
@@ -309,7 +309,7 @@
       <div class="feature-card">
         <div class="feature-icon">✨</div>
         <h3>Hook-based AI integration</h3>
-        <p>For Claude Code, Insomnia hooks directly into the event system — awake while Claude is working, asleep the moment it stops. Precise to the second.</p>
+        <p>For Claude Code, Insomnia hooks directly into the event system — awake while Claude is working, then released after a generous inactivity window.</p>
       </div>
       <div class="feature-card">
         <div class="feature-icon">📋</div>
@@ -354,7 +354,7 @@
         <tr>
           <td><strong>✨ Claude Code</strong></td>
           <td><span class="badge badge-smart">Smart</span></td>
-          <td>Hook-based — awake only while Claude is actively running tools. Idle = asleep.</td>
+          <td>Hook-based — awake while Claude is active, then releases after 15-18 minutes of quiet.</td>
         </tr>
         <tr>
           <td><strong>✏️ Cursor</strong></td>

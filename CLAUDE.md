@@ -43,9 +43,13 @@ Suggested note format:
 - [Codex] Committing and pushing local v1.4.2 source changes to `master`: package version bump, UI/footer version bump, README/docs updates, Codex notify hook setup, Codex session-transcript activity watcher for VS Code/standalone app-server surfaces, startup migration/cleanup, and this shared memory file. Claude Code hook setup is intentionally unchanged.
 - [Codex] Post-push safety review found one detrimental edge case: Codex hook setup dropped any existing top-level `notify` command in `~/.codex/config.toml`. Fixed so Insomnia only removes/replaces its own `agent-hook.js` notify line. If the user already has a custom Codex notify command, Insomnia preserves it and relies on session-transcript polling for app-server activity.
 
-## Current State (as of 2026-05-09)
+### 2026-05-16
+- [Codex] v1.4.3: fixed Claude Code (WSL) hook setup. The old installer only targeted the default WSL distro via `wsl -e python3` and swallowed failures, so hooks could be missing when Python was absent, Claude lived in a non-default distro, or WSL setup failed. New setup enumerates user WSL distros, skips system distros, uses WSL Node with nvm/Volta/Bun path discovery, writes shell-wrapped hook commands, and logs setup/remove failures. Local sandbox has no WSL distro, so validation was limited to syntax checks.
+- [Codex] Raised hook-based wake windows from 3/5 minutes to 15/18 minutes. This lowers the risk of long Claude Code/Codex reasoning gaps or long-running tool calls sleeping mid-task; trade-off is a longer wake window after stale hook activity.
 
-- **Version**: Source is v1.4.2 on `master` after push. Local installer exists in `dist/` and a copy exists in user Downloads.
+## Current State (as of 2026-05-16)
+
+- **Version**: Source is v1.4.3 locally after the Claude Code (WSL) hook setup fix. Local installer still needs to be rebuilt.
 - **Detection**: Claude Code = hook-based (`~/.claude/settings.json`). Codex = hook-based dual-path: `notify` in `~/.codex/config.toml` for CLI + session transcript watcher/poller for VS Code and standalone app-server surfaces. Cursor/Aider/Ollama = process-based with 30s grace.
-- **Known limitation**: If user's very first Codex CLI prompt takes >3 min before any `notify` fires, PC may sleep mid-generation. Subsequent turns are covered by 5-min process grace. Acceptable trade-off.
-- **Remaining release work**: Create/publish a GitHub release for v1.4.2 with the installer, then update package channels if needed (Scoop/winget). Update the DEV post or add a note if mentioning current Codex behavior matters.
+- **Known limitation**: A very first Codex CLI prompt is still not covered until its first `notify` fires. Once hook activity exists, sessions are covered by a 15-minute inactivity window and an 18-minute process-alive grace window. Acceptable trade-off.
+- **Remaining release work**: Rebuild the installer and create/publish a GitHub release for v1.4.3, then update package channels if needed (Scoop/winget). Update the DEV post or add a note if mentioning current Codex behavior matters.

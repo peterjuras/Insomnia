@@ -2,7 +2,7 @@ const { app, BrowserWindow, Tray, Menu, ipcMain, dialog, powerSaveBlocker } = re
 const path = require('path');
 const fs = require('fs');
 const os = require('os');
-const { execFile, spawn } = require('child_process');
+const { execFile, execFileSync, spawn } = require('child_process');
 
 // ── State ──────────────────────────────────────────────────────────────────────
 let mainWindow = null;
@@ -11,9 +11,11 @@ let powerSaveId = null;
 let pollInterval = null;
 let isAwake = false;
 let manualAwake = false;
+let keepDisplayAwake = false;
+let activePowerSaveBlockerType = null;
 let runningWatchedApps = [];
 let activeIntegrations = [];
-let config = { manualAwake: false, watchedApps: [], watchedIntegrations: [] };
+let config = { manualAwake: false, keepDisplayAwake: false, watchedApps: [], watchedIntegrations: [] };
 let processLastSeen = {}; // integrationId → timestamp, for process-based grace period
 let appLastSeen = {};     // exe.toLowerCase() → timestamp, for watched apps grace period
 
@@ -25,8 +27,10 @@ const HOOK_SCRIPT = app.isPackaged
   : path.join(__dirname, 'agent-hook.js');
 const SESSIONS_DIR = path.join(os.homedir(), '.insomnia');
 const SESSIONS_FILE = path.join(SESSIONS_DIR, 'agent-sessions.json');
-const SESSION_TIMEOUT_MS = 3 * 60 * 1000; // 3 minutes — timeout between hook events
-const SESSION_PROCESS_GRACE_MS = 5 * 60 * 1000; // 5 minutes — covers long AI responses with no tool calls
+const SYSTEM_WAKE_BLOCKER_TYPE = 'prevent-app-suspension';
+const DISPLAY_WAKE_BLOCKER_TYPE = 'prevent-display-sleep';
+const SESSION_TIMEOUT_MS = 15 * 60 * 1000; // 15 minutes - timeout between hook events
+const SESSION_PROCESS_GRACE_MS = 18 * 60 * 1000; // 18 minutes - covers long AI responses with no tool calls
 const PROCESS_GRACE_MS = 30 * 1000; // 30 seconds — grace period for process-based integrations/apps after process disappears
 
 // ── Available Integrations ─────────────────────────────────────────────────────
@@ -37,6 +41,14 @@ const INTEGRATIONS = [
     description: 'Keeps PC awake while Claude is actively working on tasks',
     hookBased: true,
     processNames: ['claude.exe'],
+    icon: 'claude'
+  },
+  {
+    id: 'claude-code-wsl',
+    name: 'Claude Code (WSL)',
+    description: 'Keeps PC awake while Claude Code in WSL is actively working on tasks',
+    hookBased: true,
+    processNames: ['wsl.exe'],
     icon: 'claude'
   },
   {
@@ -83,17 +95,30 @@ function loadConfig() {
   if (!config.watchedApps) config.watchedApps = [];
   if (!config.watchedIntegrations) config.watchedIntegrations = [];
   manualAwake = config.manualAwake || false;
+  keepDisplayAwake = config.keepDisplayAwake === true;
 }
 
 function saveConfig() {
   config.manualAwake = manualAwake;
+  config.keepDisplayAwake = keepDisplayAwake;
   fs.writeFileSync(CONFIG_PATH, JSON.stringify(config, null, 2));
 }
 
 // ── Power Management ───────────────────────────────────────────────────────────
+function getPowerSaveBlockerType() {
+  return keepDisplayAwake ? DISPLAY_WAKE_BLOCKER_TYPE : SYSTEM_WAKE_BLOCKER_TYPE;
+}
+
 function startCaffeinating() {
+  const blockerType = getPowerSaveBlockerType();
+  if (powerSaveId !== null && activePowerSaveBlockerType !== blockerType) {
+    powerSaveBlocker.stop(powerSaveId);
+    powerSaveId = null;
+    activePowerSaveBlockerType = null;
+  }
   if (powerSaveId === null) {
-    powerSaveId = powerSaveBlocker.start('prevent-display-sleep');
+    powerSaveId = powerSaveBlocker.start(blockerType);
+    activePowerSaveBlockerType = blockerType;
   }
   isAwake = true;
   updateTray();
@@ -105,6 +130,7 @@ function stopCaffeinating() {
     powerSaveBlocker.stop(powerSaveId);
     powerSaveId = null;
   }
+  activePowerSaveBlockerType = null;
   isAwake = false;
   updateTray();
   notifyRenderer();
@@ -226,7 +252,7 @@ function checkAgentSessions(tasklistLower) {
         : false;
 
       // If process is alive, allow a longer grace period (background builds etc)
-      // but not forever — if last hook was >5 min ago, Claude is just sitting idle
+      // but not forever - if last hook was >18 min ago, Claude is just sitting idle
       const withinGracePeriod = Object.values(data.sessions || {}).some(s => {
         if (s.integration !== def.id) return false;
         const lastActivity = new Date(s.last_activity).getTime();
@@ -469,6 +495,197 @@ function removeClaudeCodeHooks() {
   } catch {}
 }
 
+
+function toWslPath(windowsPath) {
+  const normalized = windowsPath.replace(/\\/g, '/');
+  const match = normalized.match(/^([A-Za-z]):\/(.*)$/);
+  if (!match) return normalized;
+  return `/mnt/${match[1].toLowerCase()}/${match[2]}`;
+}
+
+function quoteShellArg(value) {
+  return "'" + String(value).replace(/'/g, "'\\''") + "'";
+}
+
+const WSL_NODE_PATH_SETUP = 'for dir in "$HOME"/.nvm/versions/node/*/bin "$HOME"/.volta/bin "$HOME"/.local/bin "$HOME"/.bun/bin; do [ -d "$dir" ] && PATH="$dir:$PATH"; done';
+
+function buildWslAgentHookCommand(action) {
+  const wslHookPath = toWslPath(HOOK_SCRIPT);
+  const wslSessionsPath = toWslPath(SESSIONS_FILE);
+  const runner = `${WSL_NODE_PATH_SETUP}; exec node "$@"`;
+
+  return [
+    `INSOMNIA_SESSIONS_FILE=${quoteShellArg(wslSessionsPath)}`,
+    'sh',
+    '-c',
+    quoteShellArg(runner),
+    'sh',
+    quoteShellArg(wslHookPath),
+    quoteShellArg(action),
+    quoteShellArg('claude-code-wsl')
+  ].join(' ');
+}
+
+function decodeCommandOutput(output) {
+  if (!output) return '';
+  const buffer = Buffer.isBuffer(output) ? output : Buffer.from(String(output));
+  const decoded = buffer.includes(0)
+    ? buffer.toString('utf16le')
+    : buffer.toString('utf8');
+  return decoded.replace(/\0/g, '');
+}
+
+function formatExecError(error) {
+  const stderr = error?.stderr ? decodeCommandOutput(error.stderr).trim() : '';
+  return stderr || error?.message || 'unknown error';
+}
+
+function isSystemWslDistro(name) {
+  const normalized = name.toLowerCase();
+  return normalized === 'docker-desktop'
+    || normalized === 'docker-desktop-data'
+    || normalized === 'rancher-desktop'
+    || normalized === 'rancher-desktop-data'
+    || normalized.startsWith('podman-machine');
+}
+
+function listWslDistros() {
+  try {
+    const output = execFileSync('wsl', ['--list', '--quiet'], {
+      stdio: ['ignore', 'pipe', 'pipe'],
+      windowsHide: true
+    });
+
+    return decodeCommandOutput(output)
+      .split(/\r?\n/)
+      .map(line => line.replace(/^\uFEFF/, '').replace(/^\*\s*/, '').trim())
+      .filter(Boolean)
+      .filter(name => !isSystemWslDistro(name));
+  } catch (error) {
+    console.warn(`[Insomnia] Unable to list WSL distributions: ${formatExecError(error)}`);
+    return null;
+  }
+}
+
+function getWslHookTargets() {
+  const distros = listWslDistros();
+  if (distros === null) {
+    return [{ name: 'default', args: [] }];
+  }
+  return distros.map(name => ({ name, args: ['-d', name] }));
+}
+
+const CLAUDE_WSL_SETTINGS_SCRIPT = `
+const fs = require('fs');
+const path = require('path');
+const os = require('os');
+
+const mode = process.argv[1];
+const stayCmd = process.argv[2];
+const allowCmd = process.argv[3];
+const settingsPath = path.join(os.homedir(), '.claude', 'settings.json');
+
+function readSettings() {
+  try {
+    if (fs.existsSync(settingsPath)) {
+      return JSON.parse(fs.readFileSync(settingsPath, 'utf8'));
+    }
+  } catch {}
+  return {};
+}
+
+function hasManagedHook(entry, includeLegacy) {
+  if (!entry || !Array.isArray(entry.hooks)) return false;
+  return entry.hooks.some(hook => {
+    const command = hook && typeof hook.command === 'string' ? hook.command : '';
+    return command.includes('agent-hook.js') || (includeLegacy && command.includes('cc-caffeine'));
+  });
+}
+
+function cleanEventHooks(hooks, event, includeLegacy) {
+  const existing = Array.isArray(hooks[event]) ? hooks[event] : [];
+  hooks[event] = existing.filter(entry => !hasManagedHook(entry, includeLegacy));
+}
+
+const settings = readSettings();
+if (mode === 'setup') {
+  fs.mkdirSync(path.dirname(settingsPath), { recursive: true });
+  if (!settings.hooks || typeof settings.hooks !== 'object' || Array.isArray(settings.hooks)) {
+    settings.hooks = {};
+  }
+
+  const stayHook = { hooks: [{ type: 'command', command: stayCmd }] };
+  const allowHook = { hooks: [{ type: 'command', command: allowCmd }] };
+  for (const event of ['UserPromptSubmit', 'PreToolUse', 'PostToolUse', 'PermissionRequest', 'Notification']) {
+    cleanEventHooks(settings.hooks, event, true);
+    settings.hooks[event].push(stayHook);
+  }
+  cleanEventHooks(settings.hooks, 'SessionEnd', true);
+  settings.hooks.SessionEnd.push(allowHook);
+} else if (mode === 'remove') {
+  if (!settings.hooks || typeof settings.hooks !== 'object' || Array.isArray(settings.hooks)) {
+    process.exit(0);
+  }
+  for (const event of Object.keys(settings.hooks)) {
+    cleanEventHooks(settings.hooks, event, false);
+    if (settings.hooks[event].length === 0) delete settings.hooks[event];
+  }
+  if (Object.keys(settings.hooks).length === 0) delete settings.hooks;
+} else {
+  process.exit(2);
+}
+
+fs.mkdirSync(path.dirname(settingsPath), { recursive: true });
+fs.writeFileSync(settingsPath, JSON.stringify(settings, null, 2) + '\\n');
+`;
+
+function updateClaudeCodeWSLHooks(mode, stayAwakeCmd = '', allowSleepCmd = '') {
+  const targets = getWslHookTargets();
+  if (targets.length === 0) {
+    console.warn('[Insomnia] No user WSL distributions found for Claude Code hooks.');
+    return;
+  }
+
+  const runner = `${WSL_NODE_PATH_SETUP}; if ! command -v node >/dev/null 2>&1; then printf '%s\\n' 'Insomnia: node was not found in this WSL distribution.' >&2; exit 127; fi; exec node -e "$1" "$2" "$3" "$4"`;
+  let updated = false;
+
+  for (const target of targets) {
+    try {
+      execFileSync('wsl', [
+        ...target.args,
+        '-e',
+        'sh',
+        '-c',
+        runner,
+        'sh',
+        CLAUDE_WSL_SETTINGS_SCRIPT,
+        mode,
+        stayAwakeCmd,
+        allowSleepCmd
+      ], { stdio: ['ignore', 'ignore', 'pipe'], windowsHide: true });
+      updated = true;
+    } catch (error) {
+      console.warn(`[Insomnia] Failed to ${mode} Claude Code WSL hooks in ${target.name}: ${formatExecError(error)}`);
+    }
+  }
+
+  if (!updated) {
+    console.warn(`[Insomnia] Claude Code WSL hook ${mode} did not update any distributions.`);
+  }
+}
+
+function setupClaudeCodeWSLHooks() {
+  updateClaudeCodeWSLHooks(
+    'setup',
+    buildWslAgentHookCommand('stay-awake'),
+    buildWslAgentHookCommand('allow-sleep')
+  );
+}
+
+function removeClaudeCodeWSLHooks() {
+  updateClaudeCodeWSLHooks('remove');
+}
+
 // ── Codex Hook Setup ───────────────────────────────────────────────────────────
 // Codex (CLI / VS Code extension / desktop) all read ~/.codex/config.toml.
 // The `notify` field runs a command on agent-turn-complete events — we use it
@@ -567,11 +784,13 @@ function removeCodexHooks() {
 // ── Hook dispatch ──────────────────────────────────────────────────────────────
 function setupHooksForIntegration(integrationId) {
   if (integrationId === 'claude-code') setupClaudeCodeHooks();
+  else if (integrationId === 'claude-code-wsl') setupClaudeCodeWSLHooks();
   else if (integrationId === 'codex-cli') { setupCodexHooks(); watchCodexFiles(); }
 }
 
 function removeHooksForIntegration(integrationId) {
   if (integrationId === 'claude-code') removeClaudeCodeHooks();
+  else if (integrationId === 'claude-code-wsl') removeClaudeCodeWSLHooks();
   else if (integrationId === 'codex-cli') { removeCodexHooks(); stopCodexWatcher(); }
 }
 
@@ -597,12 +816,19 @@ function updateTray() {
   tray.setToolTip(getTooltip());
 }
 
+function showMainWindow() {
+  if (!mainWindow) return;
+  if (mainWindow.isMinimized()) mainWindow.restore();
+  mainWindow.show();
+  mainWindow.focus();
+}
+
 function createTray() {
   tray = new Tray(path.join(ASSETS, 'tray-inactive.png'));
   tray.setToolTip('Inactive');
 
   const contextMenu = Menu.buildFromTemplate([
-    { label: 'Show Insomnia', click: () => { mainWindow.show(); } },
+    { label: 'Show Insomnia', click: showMainWindow },
     { type: 'separator' },
     {
       label: 'Toggle Awake',
@@ -619,13 +845,14 @@ function createTray() {
         if (powerSaveId !== null) {
           powerSaveBlocker.stop(powerSaveId);
           powerSaveId = null;
+          activePowerSaveBlockerType = null;
         }
         app.quit();
       }
     }
   ]);
   tray.setContextMenu(contextMenu);
-  tray.on('double-click', () => { mainWindow.show(); });
+  tray.on('double-click', showMainWindow);
 
   // Try to promote tray icon to always-visible on Windows
   promoteTrayIcon();
@@ -886,6 +1113,7 @@ function getStatus() {
   return {
     isAwake,
     manualAwake,
+    keepDisplayAwake,
     watchedApps: config.watchedApps,
     watchedIntegrations: config.watchedIntegrations,
     runningWatchedApps: runningWatchedApps.map(a => a.exe),
@@ -902,6 +1130,14 @@ function setupIPC() {
     manualAwake = !manualAwake;
     saveConfig();
     evaluateState();
+    return getStatus();
+  });
+
+  ipcMain.handle('set-keep-display-awake', (_, enabled) => {
+    keepDisplayAwake = enabled === true;
+    saveConfig();
+    if (isAwake) startCaffeinating();
+    else notifyRenderer();
     return getStatus();
   });
 
@@ -1022,6 +1258,7 @@ function createWindow() {
   mainWindow = new BrowserWindow({
     width: 500,
     height: 680,
+    show: false,
     resizable: false,
     maximizable: false,
     icon: path.join(ASSETS, 'icon.png'),
@@ -1052,9 +1289,7 @@ if (!gotLock) {
   app.on('second-instance', () => {
     // Someone tried to run a second instance — focus our window instead
     if (mainWindow) {
-      if (mainWindow.isMinimized()) mainWindow.restore();
-      mainWindow.show();
-      mainWindow.focus();
+      showMainWindow();
     }
   });
 }
@@ -1068,6 +1303,7 @@ app.on('before-quit', () => {
   if (powerSaveId !== null) {
     powerSaveBlocker.stop(powerSaveId);
     powerSaveId = null;
+    activePowerSaveBlockerType = null;
   }
 });
 

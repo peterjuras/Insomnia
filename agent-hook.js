@@ -14,8 +14,9 @@ const fs = require('fs');
 const path = require('path');
 const os = require('os');
 
-const SESSIONS_DIR = path.join(os.homedir(), '.insomnia');
-const SESSIONS_FILE = path.join(SESSIONS_DIR, 'agent-sessions.json');
+const sessionsOverride = process.env.INSOMNIA_SESSIONS_FILE;
+const SESSIONS_FILE = sessionsOverride || path.join(os.homedir(), '.insomnia', 'agent-sessions.json');
+const SESSIONS_DIR = path.dirname(SESSIONS_FILE);
 
 const command = process.argv[2];
 const integrationId = process.argv[3] || 'unknown';

@@ -4,6 +4,7 @@ contextBridge.exposeInMainWorld('insomnia', {
   // Status
   getStatus: () => ipcRenderer.invoke('get-status'),
   toggleAwake: () => ipcRenderer.invoke('toggle-awake'),
+  setKeepDisplayAwake: (enabled) => ipcRenderer.invoke('set-keep-display-awake', enabled),
   onStatusUpdate: (callback) => {
     ipcRenderer.on('status-update', (_, status) => callback(status));
   },

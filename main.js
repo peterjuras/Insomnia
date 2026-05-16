@@ -2,7 +2,7 @@ const { app, BrowserWindow, Tray, Menu, ipcMain, dialog, powerSaveBlocker } = re
 const path = require('path');
 const fs = require('fs');
 const os = require('os');
-const { execFile, spawn } = require('child_process');
+const { execFile, execFileSync, spawn } = require('child_process');
 
 // ── State ──────────────────────────────────────────────────────────────────────
 let mainWindow = null;
@@ -37,6 +37,14 @@ const INTEGRATIONS = [
     description: 'Keeps PC awake while Claude is actively working on tasks',
     hookBased: true,
     processNames: ['claude.exe'],
+    icon: 'claude'
+  },
+  {
+    id: 'claude-code-wsl',
+    name: 'Claude Code (WSL)',
+    description: 'Keeps PC awake while Claude Code in WSL is actively working on tasks',
+    hookBased: true,
+    processNames: ['wsl.exe'],
     icon: 'claude'
   },
   {
@@ -469,6 +477,79 @@ function removeClaudeCodeHooks() {
   } catch {}
 }
 
+
+function toWslPath(windowsPath) {
+  const normalized = windowsPath.replace(/\\/g, '/');
+  const match = normalized.match(/^([A-Za-z]):\/(.*)$/);
+  if (!match) return normalized;
+  return `/mnt/${match[1].toLowerCase()}/${match[2]}`;
+}
+
+function setupClaudeCodeWSLHooks() {
+  const userProfile = process.env.USERPROFILE;
+  if (!userProfile) return;
+
+  const windowsSessionsPath = path.join(userProfile, '.insomnia', 'agent-sessions.json');
+  const wslHookPath = toWslPath(HOOK_SCRIPT);
+  const wslSessionsPath = toWslPath(windowsSessionsPath);
+  const stayAwakeCmd = `INSOMNIA_SESSIONS_FILE="${wslSessionsPath}" node "${wslHookPath}" stay-awake claude-code-wsl`;
+  const allowSleepCmd = `INSOMNIA_SESSIONS_FILE="${wslSessionsPath}" node "${wslHookPath}" allow-sleep claude-code-wsl`;
+
+  const pythonScript = `
+import json, pathlib, sys
+settings_path = pathlib.Path.home() / '.claude' / 'settings.json'
+settings_path.parent.mkdir(parents=True, exist_ok=True)
+try:
+    settings = json.loads(settings_path.read_text(encoding='utf-8')) if settings_path.exists() else {}
+except Exception:
+    settings = {}
+hooks = settings.setdefault('hooks', {})
+stay_cmd, allow_cmd = sys.argv[1], sys.argv[2]
+stay_hook = {'hooks': [{'type': 'command', 'command': stay_cmd}]}
+allow_hook = {'hooks': [{'type': 'command', 'command': allow_cmd}]}
+for event in ['UserPromptSubmit', 'PreToolUse', 'PostToolUse', 'PermissionRequest', 'Notification']:
+    arr = hooks.setdefault(event, [])
+    arr[:] = [h for h in arr if not any('cc-caffeine' in hh.get('command','') or 'agent-hook.js' in hh.get('command','') for hh in h.get('hooks',[]))]
+    arr.append(stay_hook)
+arr = hooks.setdefault('SessionEnd', [])
+arr[:] = [h for h in arr if not any('cc-caffeine' in hh.get('command','') or 'agent-hook.js' in hh.get('command','') for hh in h.get('hooks',[]))]
+arr.append(allow_hook)
+settings_path.write_text(json.dumps(settings, indent=2) + '\n', encoding='utf-8')
+`;
+
+  try {
+    execFileSync('wsl', ['-e', 'python3', '-c', pythonScript, stayAwakeCmd, allowSleepCmd], { stdio: 'ignore', windowsHide: true });
+  } catch {}
+}
+
+function removeClaudeCodeWSLHooks() {
+  const pythonScript = `
+import json, pathlib
+settings_path = pathlib.Path.home() / '.claude' / 'settings.json'
+if not settings_path.exists():
+    raise SystemExit(0)
+try:
+    settings = json.loads(settings_path.read_text(encoding='utf-8'))
+except Exception:
+    raise SystemExit(0)
+hooks = settings.get('hooks')
+if not isinstance(hooks, dict):
+    raise SystemExit(0)
+for event in list(hooks.keys()):
+    arr = hooks.get(event, [])
+    hooks[event] = [h for h in arr if not any('agent-hook.js' in hh.get('command','') for hh in h.get('hooks',[]))]
+    if not hooks[event]:
+      del hooks[event]
+if not hooks:
+    settings.pop('hooks', None)
+settings_path.write_text(json.dumps(settings, indent=2) + '\n', encoding='utf-8')
+`;
+
+  try {
+    execFileSync('wsl', ['-e', 'python3', '-c', pythonScript], { stdio: 'ignore', windowsHide: true });
+  } catch {}
+}
+
 // ── Codex Hook Setup ───────────────────────────────────────────────────────────
 // Codex (CLI / VS Code extension / desktop) all read ~/.codex/config.toml.
 // The `notify` field runs a command on agent-turn-complete events — we use it
@@ -567,11 +648,13 @@ function removeCodexHooks() {
 // ── Hook dispatch ──────────────────────────────────────────────────────────────
 function setupHooksForIntegration(integrationId) {
   if (integrationId === 'claude-code') setupClaudeCodeHooks();
+  else if (integrationId === 'claude-code-wsl') setupClaudeCodeWSLHooks();
   else if (integrationId === 'codex-cli') { setupCodexHooks(); watchCodexFiles(); }
 }
 
 function removeHooksForIntegration(integrationId) {
   if (integrationId === 'claude-code') removeClaudeCodeHooks();
+  else if (integrationId === 'claude-code-wsl') removeClaudeCodeWSLHooks();
   else if (integrationId === 'codex-cli') { removeCodexHooks(); stopCodexWatcher(); }
 }
 

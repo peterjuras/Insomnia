@@ -2,7 +2,9 @@
 const statusDot = document.getElementById('statusDot');
 const statusText = document.getElementById('statusText');
 const manualToggle = document.getElementById('manualToggle');
+const displayToggle = document.getElementById('displayToggle');
 const reasonText = document.getElementById('reasonText');
+const displayModeText = document.getElementById('displayModeText');
 const triggerList = document.getElementById('triggerList');
 const emptyMessage = document.getElementById('emptyMessage');
 const addBtn = document.getElementById('addBtn');
@@ -32,6 +34,10 @@ function updateUI(status) {
   statusText.textContent = status.isAwake ? 'Staying Awake' : 'Inactive';
 
   manualToggle.checked = status.manualAwake;
+  displayToggle.checked = status.keepDisplayAwake === true;
+  displayModeText.textContent = status.keepDisplayAwake
+    ? 'Display stays on during wake lock'
+    : 'Display may turn off normally';
 
   if (status.isAwake) {
     const reasons = [];
@@ -130,6 +136,10 @@ function renderTriggerList(status) {
 // ── Manual Toggle ──────────────────────────────────────────────────────────────
 manualToggle.addEventListener('change', () => {
   window.insomnia.toggleAwake();
+});
+
+displayToggle.addEventListener('change', () => {
+  window.insomnia.setKeepDisplayAwake(displayToggle.checked);
 });
 
 // ── Drawer Tabs ────────────────────────────────────────────────────────────────

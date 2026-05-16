@@ -11,9 +11,11 @@ let powerSaveId = null;
 let pollInterval = null;
 let isAwake = false;
 let manualAwake = false;
+let keepDisplayAwake = false;
+let activePowerSaveBlockerType = null;
 let runningWatchedApps = [];
 let activeIntegrations = [];
-let config = { manualAwake: false, watchedApps: [], watchedIntegrations: [] };
+let config = { manualAwake: false, keepDisplayAwake: false, watchedApps: [], watchedIntegrations: [] };
 let processLastSeen = {}; // integrationId → timestamp, for process-based grace period
 let appLastSeen = {};     // exe.toLowerCase() → timestamp, for watched apps grace period
 
@@ -25,8 +27,10 @@ const HOOK_SCRIPT = app.isPackaged
   : path.join(__dirname, 'agent-hook.js');
 const SESSIONS_DIR = path.join(os.homedir(), '.insomnia');
 const SESSIONS_FILE = path.join(SESSIONS_DIR, 'agent-sessions.json');
-const SESSION_TIMEOUT_MS = 3 * 60 * 1000; // 3 minutes — timeout between hook events
-const SESSION_PROCESS_GRACE_MS = 5 * 60 * 1000; // 5 minutes — covers long AI responses with no tool calls
+const SYSTEM_WAKE_BLOCKER_TYPE = 'prevent-app-suspension';
+const DISPLAY_WAKE_BLOCKER_TYPE = 'prevent-display-sleep';
+const SESSION_TIMEOUT_MS = 15 * 60 * 1000; // 15 minutes - timeout between hook events
+const SESSION_PROCESS_GRACE_MS = 18 * 60 * 1000; // 18 minutes - covers long AI responses with no tool calls
 const PROCESS_GRACE_MS = 30 * 1000; // 30 seconds — grace period for process-based integrations/apps after process disappears
 
 // ── Available Integrations ─────────────────────────────────────────────────────
@@ -91,17 +95,30 @@ function loadConfig() {
   if (!config.watchedApps) config.watchedApps = [];
   if (!config.watchedIntegrations) config.watchedIntegrations = [];
   manualAwake = config.manualAwake || false;
+  keepDisplayAwake = config.keepDisplayAwake === true;
 }
 
 function saveConfig() {
   config.manualAwake = manualAwake;
+  config.keepDisplayAwake = keepDisplayAwake;
   fs.writeFileSync(CONFIG_PATH, JSON.stringify(config, null, 2));
 }
 
 // ── Power Management ───────────────────────────────────────────────────────────
+function getPowerSaveBlockerType() {
+  return keepDisplayAwake ? DISPLAY_WAKE_BLOCKER_TYPE : SYSTEM_WAKE_BLOCKER_TYPE;
+}
+
 function startCaffeinating() {
+  const blockerType = getPowerSaveBlockerType();
+  if (powerSaveId !== null && activePowerSaveBlockerType !== blockerType) {
+    powerSaveBlocker.stop(powerSaveId);
+    powerSaveId = null;
+    activePowerSaveBlockerType = null;
+  }
   if (powerSaveId === null) {
-    powerSaveId = powerSaveBlocker.start('prevent-display-sleep');
+    powerSaveId = powerSaveBlocker.start(blockerType);
+    activePowerSaveBlockerType = blockerType;
   }
   isAwake = true;
   updateTray();
@@ -113,6 +130,7 @@ function stopCaffeinating() {
     powerSaveBlocker.stop(powerSaveId);
     powerSaveId = null;
   }
+  activePowerSaveBlockerType = null;
   isAwake = false;
   updateTray();
   notifyRenderer();
@@ -234,7 +252,7 @@ function checkAgentSessions(tasklistLower) {
         : false;
 
       // If process is alive, allow a longer grace period (background builds etc)
-      // but not forever — if last hook was >5 min ago, Claude is just sitting idle
+      // but not forever - if last hook was >18 min ago, Claude is just sitting idle
       const withinGracePeriod = Object.values(data.sessions || {}).some(s => {
         if (s.integration !== def.id) return false;
         const lastActivity = new Date(s.last_activity).getTime();
@@ -798,12 +816,19 @@ function updateTray() {
   tray.setToolTip(getTooltip());
 }
 
+function showMainWindow() {
+  if (!mainWindow) return;
+  if (mainWindow.isMinimized()) mainWindow.restore();
+  mainWindow.show();
+  mainWindow.focus();
+}
+
 function createTray() {
   tray = new Tray(path.join(ASSETS, 'tray-inactive.png'));
   tray.setToolTip('Inactive');
 
   const contextMenu = Menu.buildFromTemplate([
-    { label: 'Show Insomnia', click: () => { mainWindow.show(); } },
+    { label: 'Show Insomnia', click: showMainWindow },
     { type: 'separator' },
     {
       label: 'Toggle Awake',
@@ -820,13 +845,14 @@ function createTray() {
         if (powerSaveId !== null) {
           powerSaveBlocker.stop(powerSaveId);
           powerSaveId = null;
+          activePowerSaveBlockerType = null;
         }
         app.quit();
       }
     }
   ]);
   tray.setContextMenu(contextMenu);
-  tray.on('double-click', () => { mainWindow.show(); });
+  tray.on('double-click', showMainWindow);
 
   // Try to promote tray icon to always-visible on Windows
   promoteTrayIcon();
@@ -1087,6 +1113,7 @@ function getStatus() {
   return {
     isAwake,
     manualAwake,
+    keepDisplayAwake,
     watchedApps: config.watchedApps,
     watchedIntegrations: config.watchedIntegrations,
     runningWatchedApps: runningWatchedApps.map(a => a.exe),
@@ -1103,6 +1130,14 @@ function setupIPC() {
     manualAwake = !manualAwake;
     saveConfig();
     evaluateState();
+    return getStatus();
+  });
+
+  ipcMain.handle('set-keep-display-awake', (_, enabled) => {
+    keepDisplayAwake = enabled === true;
+    saveConfig();
+    if (isAwake) startCaffeinating();
+    else notifyRenderer();
     return getStatus();
   });
 
@@ -1223,6 +1258,7 @@ function createWindow() {
   mainWindow = new BrowserWindow({
     width: 500,
     height: 680,
+    show: false,
     resizable: false,
     maximizable: false,
     icon: path.join(ASSETS, 'icon.png'),
@@ -1253,9 +1289,7 @@ if (!gotLock) {
   app.on('second-instance', () => {
     // Someone tried to run a second instance — focus our window instead
     if (mainWindow) {
-      if (mainWindow.isMinimized()) mainWindow.restore();
-      mainWindow.show();
-      mainWindow.focus();
+      showMainWindow();
     }
   });
 }
@@ -1269,6 +1303,7 @@ app.on('before-quit', () => {
   if (powerSaveId !== null) {
     powerSaveBlocker.stop(powerSaveId);
     powerSaveId = null;
+    activePowerSaveBlockerType = null;
   }
 });
 

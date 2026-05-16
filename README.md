@@ -32,7 +32,7 @@ Insomnia has built-in support for AI coding tools with two types of monitoring:
 | **OpenAI Codex** | Hook-based | Knows when Codex is *actively working* (CLI, VS Code, or desktop). Uses Codex's `notify` config plus Codex session activity to track active work. |
 | **Ollama** | Process-based | Keeps awake during local AI model inference |
 
-The Claude Code integration is **hook-based** — it hooks directly into Claude Code's event system so your PC stays awake only while Claude is actively running tools and generating code, not when it's sitting idle waiting for your next prompt. Once Claude finishes, Insomnia releases within 3 minutes of inactivity.
+The Claude Code integration is **hook-based** — it hooks directly into Claude Code's event system so your PC stays awake only while Claude is actively running tools and generating code, not when it's sitting idle waiting for your next prompt. Once Claude goes quiet, Insomnia releases after 15 minutes of hook inactivity, or after 18 minutes when the related process is still alive.
 
 ### App Watching
 
@@ -92,11 +92,11 @@ npm start
 
 ## How It Works
 
-Insomnia uses Electron's `powerSaveBlocker` API to prevent Windows from entering sleep mode. It evaluates whether to stay awake based on three signals:
+Insomnia uses Electron's `powerSaveBlocker` API to prevent Windows from entering sleep mode. By default it uses `prevent-app-suspension`, so the PC stays awake while the display can still turn off normally; the "Keep Display On" checkbox switches active wake locks to `prevent-display-sleep` when you also want the screen to stay on. It evaluates whether to stay awake based on three signals:
 
 1. **Manual toggle** — User explicitly wants the PC awake
 2. **Process monitoring** — Polls `tasklist` every 10 seconds to check if watched apps are running
-3. **Hook-based sessions** — For tools like Claude Code, lightweight hooks signal activity to a shared session file (`~/.insomnia/agent-sessions.json`). Sessions expire after 3 minutes of inactivity.
+3. **Hook-based sessions** — For tools like Claude Code, lightweight hooks signal activity to a shared session file (`~/.insomnia/agent-sessions.json`). Sessions expire after 15 minutes of inactivity, with an 18-minute grace window while the related process is still alive.
 
 If *any* trigger is active, the PC stays awake. When *all* triggers go inactive, normal sleep behavior resumes.
 
@@ -107,7 +107,7 @@ When you enable the Claude Code integration, Insomnia adds hooks to `~/.claude/s
 - `UserPromptSubmit`, `PreToolUse`, `PostToolUse`, `PermissionRequest`, `Notification` → signal activity (stay awake)
 - `SessionEnd` → signal idle (allow sleep)
 
-This means your PC stays awake precisely while Claude is doing work — reading files, running commands, writing code — and goes back to normal the moment it stops. No wasted power, no interrupted sessions.
+This means your PC stays awake while Claude is doing work — reading files, running commands, writing code — and then returns to normal after the inactivity window expires. No interrupted sessions, without keeping the machine awake indefinitely.
 
 ### OpenAI Codex Integration Details
 

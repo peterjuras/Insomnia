@@ -485,69 +485,187 @@ function toWslPath(windowsPath) {
   return `/mnt/${match[1].toLowerCase()}/${match[2]}`;
 }
 
-function setupClaudeCodeWSLHooks() {
-  const userProfile = process.env.USERPROFILE;
-  if (!userProfile) return;
+function quoteShellArg(value) {
+  return "'" + String(value).replace(/'/g, "'\\''") + "'";
+}
 
-  const windowsSessionsPath = path.join(userProfile, '.insomnia', 'agent-sessions.json');
+const WSL_NODE_PATH_SETUP = 'for dir in "$HOME"/.nvm/versions/node/*/bin "$HOME"/.volta/bin "$HOME"/.local/bin "$HOME"/.bun/bin; do [ -d "$dir" ] && PATH="$dir:$PATH"; done';
+
+function buildWslAgentHookCommand(action) {
   const wslHookPath = toWslPath(HOOK_SCRIPT);
-  const wslSessionsPath = toWslPath(windowsSessionsPath);
-  const stayAwakeCmd = `INSOMNIA_SESSIONS_FILE="${wslSessionsPath}" node "${wslHookPath}" stay-awake claude-code-wsl`;
-  const allowSleepCmd = `INSOMNIA_SESSIONS_FILE="${wslSessionsPath}" node "${wslHookPath}" allow-sleep claude-code-wsl`;
+  const wslSessionsPath = toWslPath(SESSIONS_FILE);
+  const runner = `${WSL_NODE_PATH_SETUP}; exec node "$@"`;
 
-  const pythonScript = `
-import json, pathlib, sys
-settings_path = pathlib.Path.home() / '.claude' / 'settings.json'
-settings_path.parent.mkdir(parents=True, exist_ok=True)
-try:
-    settings = json.loads(settings_path.read_text(encoding='utf-8')) if settings_path.exists() else {}
-except Exception:
-    settings = {}
-hooks = settings.setdefault('hooks', {})
-stay_cmd, allow_cmd = sys.argv[1], sys.argv[2]
-stay_hook = {'hooks': [{'type': 'command', 'command': stay_cmd}]}
-allow_hook = {'hooks': [{'type': 'command', 'command': allow_cmd}]}
-for event in ['UserPromptSubmit', 'PreToolUse', 'PostToolUse', 'PermissionRequest', 'Notification']:
-    arr = hooks.setdefault(event, [])
-    arr[:] = [h for h in arr if not any('cc-caffeine' in hh.get('command','') or 'agent-hook.js' in hh.get('command','') for hh in h.get('hooks',[]))]
-    arr.append(stay_hook)
-arr = hooks.setdefault('SessionEnd', [])
-arr[:] = [h for h in arr if not any('cc-caffeine' in hh.get('command','') or 'agent-hook.js' in hh.get('command','') for hh in h.get('hooks',[]))]
-arr.append(allow_hook)
-settings_path.write_text(json.dumps(settings, indent=2) + '\n', encoding='utf-8')
+  return [
+    `INSOMNIA_SESSIONS_FILE=${quoteShellArg(wslSessionsPath)}`,
+    'sh',
+    '-c',
+    quoteShellArg(runner),
+    'sh',
+    quoteShellArg(wslHookPath),
+    quoteShellArg(action),
+    quoteShellArg('claude-code-wsl')
+  ].join(' ');
+}
+
+function decodeCommandOutput(output) {
+  if (!output) return '';
+  const buffer = Buffer.isBuffer(output) ? output : Buffer.from(String(output));
+  const decoded = buffer.includes(0)
+    ? buffer.toString('utf16le')
+    : buffer.toString('utf8');
+  return decoded.replace(/\0/g, '');
+}
+
+function formatExecError(error) {
+  const stderr = error?.stderr ? decodeCommandOutput(error.stderr).trim() : '';
+  return stderr || error?.message || 'unknown error';
+}
+
+function isSystemWslDistro(name) {
+  const normalized = name.toLowerCase();
+  return normalized === 'docker-desktop'
+    || normalized === 'docker-desktop-data'
+    || normalized === 'rancher-desktop'
+    || normalized === 'rancher-desktop-data'
+    || normalized.startsWith('podman-machine');
+}
+
+function listWslDistros() {
+  try {
+    const output = execFileSync('wsl', ['--list', '--quiet'], {
+      stdio: ['ignore', 'pipe', 'pipe'],
+      windowsHide: true
+    });
+
+    return decodeCommandOutput(output)
+      .split(/\r?\n/)
+      .map(line => line.replace(/^\uFEFF/, '').replace(/^\*\s*/, '').trim())
+      .filter(Boolean)
+      .filter(name => !isSystemWslDistro(name));
+  } catch (error) {
+    console.warn(`[Insomnia] Unable to list WSL distributions: ${formatExecError(error)}`);
+    return null;
+  }
+}
+
+function getWslHookTargets() {
+  const distros = listWslDistros();
+  if (distros === null) {
+    return [{ name: 'default', args: [] }];
+  }
+  return distros.map(name => ({ name, args: ['-d', name] }));
+}
+
+const CLAUDE_WSL_SETTINGS_SCRIPT = `
+const fs = require('fs');
+const path = require('path');
+const os = require('os');
+
+const mode = process.argv[1];
+const stayCmd = process.argv[2];
+const allowCmd = process.argv[3];
+const settingsPath = path.join(os.homedir(), '.claude', 'settings.json');
+
+function readSettings() {
+  try {
+    if (fs.existsSync(settingsPath)) {
+      return JSON.parse(fs.readFileSync(settingsPath, 'utf8'));
+    }
+  } catch {}
+  return {};
+}
+
+function hasManagedHook(entry, includeLegacy) {
+  if (!entry || !Array.isArray(entry.hooks)) return false;
+  return entry.hooks.some(hook => {
+    const command = hook && typeof hook.command === 'string' ? hook.command : '';
+    return command.includes('agent-hook.js') || (includeLegacy && command.includes('cc-caffeine'));
+  });
+}
+
+function cleanEventHooks(hooks, event, includeLegacy) {
+  const existing = Array.isArray(hooks[event]) ? hooks[event] : [];
+  hooks[event] = existing.filter(entry => !hasManagedHook(entry, includeLegacy));
+}
+
+const settings = readSettings();
+if (mode === 'setup') {
+  fs.mkdirSync(path.dirname(settingsPath), { recursive: true });
+  if (!settings.hooks || typeof settings.hooks !== 'object' || Array.isArray(settings.hooks)) {
+    settings.hooks = {};
+  }
+
+  const stayHook = { hooks: [{ type: 'command', command: stayCmd }] };
+  const allowHook = { hooks: [{ type: 'command', command: allowCmd }] };
+  for (const event of ['UserPromptSubmit', 'PreToolUse', 'PostToolUse', 'PermissionRequest', 'Notification']) {
+    cleanEventHooks(settings.hooks, event, true);
+    settings.hooks[event].push(stayHook);
+  }
+  cleanEventHooks(settings.hooks, 'SessionEnd', true);
+  settings.hooks.SessionEnd.push(allowHook);
+} else if (mode === 'remove') {
+  if (!settings.hooks || typeof settings.hooks !== 'object' || Array.isArray(settings.hooks)) {
+    process.exit(0);
+  }
+  for (const event of Object.keys(settings.hooks)) {
+    cleanEventHooks(settings.hooks, event, false);
+    if (settings.hooks[event].length === 0) delete settings.hooks[event];
+  }
+  if (Object.keys(settings.hooks).length === 0) delete settings.hooks;
+} else {
+  process.exit(2);
+}
+
+fs.mkdirSync(path.dirname(settingsPath), { recursive: true });
+fs.writeFileSync(settingsPath, JSON.stringify(settings, null, 2) + '\\n');
 `;
 
-  try {
-    execFileSync('wsl', ['-e', 'python3', '-c', pythonScript, stayAwakeCmd, allowSleepCmd], { stdio: 'ignore', windowsHide: true });
-  } catch {}
+function updateClaudeCodeWSLHooks(mode, stayAwakeCmd = '', allowSleepCmd = '') {
+  const targets = getWslHookTargets();
+  if (targets.length === 0) {
+    console.warn('[Insomnia] No user WSL distributions found for Claude Code hooks.');
+    return;
+  }
+
+  const runner = `${WSL_NODE_PATH_SETUP}; if ! command -v node >/dev/null 2>&1; then printf '%s\\n' 'Insomnia: node was not found in this WSL distribution.' >&2; exit 127; fi; exec node -e "$1" "$2" "$3" "$4"`;
+  let updated = false;
+
+  for (const target of targets) {
+    try {
+      execFileSync('wsl', [
+        ...target.args,
+        '-e',
+        'sh',
+        '-c',
+        runner,
+        'sh',
+        CLAUDE_WSL_SETTINGS_SCRIPT,
+        mode,
+        stayAwakeCmd,
+        allowSleepCmd
+      ], { stdio: ['ignore', 'ignore', 'pipe'], windowsHide: true });
+      updated = true;
+    } catch (error) {
+      console.warn(`[Insomnia] Failed to ${mode} Claude Code WSL hooks in ${target.name}: ${formatExecError(error)}`);
+    }
+  }
+
+  if (!updated) {
+    console.warn(`[Insomnia] Claude Code WSL hook ${mode} did not update any distributions.`);
+  }
+}
+
+function setupClaudeCodeWSLHooks() {
+  updateClaudeCodeWSLHooks(
+    'setup',
+    buildWslAgentHookCommand('stay-awake'),
+    buildWslAgentHookCommand('allow-sleep')
+  );
 }
 
 function removeClaudeCodeWSLHooks() {
-  const pythonScript = `
-import json, pathlib
-settings_path = pathlib.Path.home() / '.claude' / 'settings.json'
-if not settings_path.exists():
-    raise SystemExit(0)
-try:
-    settings = json.loads(settings_path.read_text(encoding='utf-8'))
-except Exception:
-    raise SystemExit(0)
-hooks = settings.get('hooks')
-if not isinstance(hooks, dict):
-    raise SystemExit(0)
-for event in list(hooks.keys()):
-    arr = hooks.get(event, [])
-    hooks[event] = [h for h in arr if not any('agent-hook.js' in hh.get('command','') for hh in h.get('hooks',[]))]
-    if not hooks[event]:
-      del hooks[event]
-if not hooks:
-    settings.pop('hooks', None)
-settings_path.write_text(json.dumps(settings, indent=2) + '\n', encoding='utf-8')
-`;
-
-  try {
-    execFileSync('wsl', ['-e', 'python3', '-c', pythonScript], { stdio: 'ignore', windowsHide: true });
-  } catch {}
+  updateClaudeCodeWSLHooks('remove');
 }
 
 // ── Codex Hook Setup ───────────────────────────────────────────────────────────
